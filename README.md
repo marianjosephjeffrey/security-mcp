@@ -1,6 +1,6 @@
 # security-mcp
 
-An MCP server that gives Claude security intelligence tools. Starting small with one
+An MCP server that gives MCP Client security intelligence tools. Starting small with one
 tool — `lookup_cve` — and designed to grow.
 
 ## What it does (so far)
