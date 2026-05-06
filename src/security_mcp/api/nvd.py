@@ -3,8 +3,8 @@
 Talks to the NIST NVD 2.0 REST API to retrieve CVE data.
 Docs: https://nvd.nist.gov/developers/vulnerabilities
 
-Without an API key, NVD allows ~5 requests per 30 seconds.
-With a free API key, that jumps to 50 requests per 30 seconds.
+Without an API key: ~5 requests per 30 seconds.
+With a free API key: ~50 requests per 30 seconds.
 Get one at: https://nvd.nist.gov/developers/request-an-api-key
 """
 
@@ -16,7 +16,7 @@ from typing import Any
 import httpx
 
 NVD_BASE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-USER_AGENT = "security-mcp/0.1.0"
+USER_AGENT = "security-mcp/0.2.0"
 DEFAULT_TIMEOUT = 30.0
 
 
@@ -27,14 +27,11 @@ class NvdError(Exception):
 async def fetch_cve(cve_id: str) -> dict[str, Any]:
     """Fetch a single CVE record from the NVD.
 
-    Args:
-        cve_id: A CVE identifier like "CVE-2024-3400".
-
-    Returns:
-        Parsed JSON dict containing the raw NVD response.
+    Returns the full NVD response dict. Use `extract_cve()` to get just the
+    inner CVE object.
 
     Raises:
-        NvdError: If the request fails or the CVE is not found.
+        NvdError: If the request fails, is rate-limited, or the CVE isn't found.
     """
     headers = {"User-Agent": USER_AGENT}
     api_key = os.environ.get("NVD_API_KEY")
@@ -64,3 +61,8 @@ async def fetch_cve(cve_id: str) -> dict[str, Any]:
         raise NvdError(f"CVE {cve_id} not found in NVD")
 
     return data
+
+
+def extract_cve(raw: dict[str, Any]) -> dict[str, Any]:
+    """Extract the inner CVE object from an NVD API response wrapper."""
+    return raw["vulnerabilities"][0]["cve"]

@@ -14,6 +14,7 @@ build/
 dist/
 *.egg-info/
 *.egg
+.installed.cfg
 
 # Editor/IDE
 .vscode/
@@ -30,3 +31,9 @@ Thumbs.db
 .env
 .env.local
 *.local.json
+
+# Test/coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/

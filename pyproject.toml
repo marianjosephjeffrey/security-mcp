@@ -1,7 +1,7 @@
 [project]
 name = "security-mcp"
-version = "0.1.0"
-description = "MCP server providing security intelligence tools (starting with NVD CVE lookup)"
+version = "0.2.0"
+description = "MCP server providing security intelligence tools (CVE lookup, EPSS, KEV, triage, mitigation)"
 requires-python = ">=3.10"
 dependencies = [
     "fastmcp>=2.0.0",
