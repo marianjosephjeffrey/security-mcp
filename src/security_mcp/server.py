@@ -31,6 +31,7 @@ from security_mcp.bulk import bulk_triage as _bulk_triage
 from security_mcp.formatters import format_cve, format_epss, format_exploits, format_kev
 from security_mcp.mitigation import extract_mitigation
 from security_mcp.triage import triage
+from security_mcp.version_info import extract_affected_versions
 
 mcp = FastMCP("security-mcp")
 
@@ -273,6 +274,37 @@ async def map_to_attack_techniques(cve_id: str) -> dict[str, Any]:
         "cwes_used_for_mapping": cwes,
         **mapping,
     }
+
+
+# ============================================================
+# Tool 9: get_affected_versions (NEW)
+# ============================================================
+
+@mcp.tool()
+async def get_affected_versions(cve_id: str) -> dict[str, Any]:
+    """Get the specific products and version ranges affected by a CVE.
+
+    Use whenever the user asks "what versions are vulnerable to CVE-XXX?",
+    "what versions should I avoid?", or "is version X affected by CVE-Y?".
+    Parses NVD's configurations field and returns a per-product breakdown
+    with human-readable version ranges (e.g. "from 2.0 (inclusive) up to
+    2.15.0 (exclusive)").
+
+    Note: NVD lists vulnerable versions, not safe ones. The latest safe
+    version must be confirmed against the vendor's release page — newer
+    versions outside the listed ranges could have their own CVEs.
+
+    Args:
+        cve_id: A CVE identifier in the format CVE-YYYY-NNNN.
+    """
+    validated = _validate_cve_id(cve_id)
+    if isinstance(validated, dict):
+        return validated
+    try:
+        raw = await fetch_cve(validated)
+    except NvdError as e:
+        return {"error": str(e), "cve_id": validated}
+    return extract_affected_versions(extract_cve(raw))
 
 
 def main() -> None:
