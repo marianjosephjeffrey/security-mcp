@@ -1,11 +1,18 @@
 """Security MCP server.
 
-Exposed tools:
-  - lookup_cve         : NVD CVE record (description, CVSS, CWEs, references).
-  - get_epss_score     : Exploit Prediction Scoring System probability.
-  - check_kev_status   : Whether the CVE is on CISA's actively-exploited list.
-  - triage_cve         : Combines all three above into a verdict.
-  - get_mitigation     : Patch and advisory references plus CWE-based guidance.
+Exposed tools (8 total):
+
+  Per-CVE intelligence:
+    - lookup_cve                : NVD CVE record
+    - get_epss_score            : Exploit Prediction Scoring System probability
+    - check_kev_status          : Active-exploitation check (CISA KEV)
+    - search_exploit_db         : Public exploit code search (Exploit-DB)
+    - get_mitigation            : Patch + advisory + CWE guidance
+    - map_to_attack_techniques  : CVE -> MITRE ATT&CK techniques via CWE/CAPEC
+
+  Orchestrators:
+    - triage_cve                : CVSS + EPSS + KEV + ExploitDB -> verdict
+    - bulk_triage               : Triage a list of CVEs in parallel, sorted by priority
 """
 
 from __future__ import annotations
@@ -16,9 +23,12 @@ from typing import Any
 from fastmcp import FastMCP
 
 from security_mcp.api.epss import EpssError, fetch_epss
+from security_mcp.api.exploitdb import ExploitDbError, lookup_exploits
 from security_mcp.api.kev import KevError, lookup_kev
 from security_mcp.api.nvd import NvdError, extract_cve, fetch_cve
-from security_mcp.formatters import format_cve, format_epss, format_kev
+from security_mcp.attack_map import map_cwes_to_attack
+from security_mcp.bulk import bulk_triage as _bulk_triage
+from security_mcp.formatters import format_cve, format_epss, format_exploits, format_kev
 from security_mcp.mitigation import extract_mitigation
 from security_mcp.triage import triage
 
@@ -28,12 +38,10 @@ CVE_ID_PATTERN = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 
 
 def _validate_cve_id(cve_id: str) -> str | dict[str, Any]:
-    """Return cleaned CVE ID, or an error dict if invalid."""
     cleaned = cve_id.strip().upper()
     if not CVE_ID_PATTERN.match(cleaned):
         return {
-            "error": f"Invalid CVE ID format: {cve_id!r}. Expected format: CVE-YYYY-NNNN "
-                     "(e.g. CVE-2024-3400)."
+            "error": f"Invalid CVE ID format: {cve_id!r}. Expected format: CVE-YYYY-NNNN."
         }
     return cleaned
 
@@ -46,9 +54,8 @@ def _validate_cve_id(cve_id: str) -> str | dict[str, Any]:
 async def lookup_cve(cve_id: str) -> dict[str, Any]:
     """Look up detailed information about a CVE from the NIST National Vulnerability Database.
 
-    Use this whenever the user asks about a specific CVE identifier (e.g. "What is
-    CVE-2024-3400?", "Tell me about Log4Shell"). Returns description, CVSS score,
-    CWEs, and reference links. For a full risk assessment, use `triage_cve` instead.
+    Use whenever the user asks about a specific CVE identifier. Returns description,
+    CVSS score, CWEs, and reference links. For a full risk assessment use `triage_cve`.
 
     Args:
         cve_id: A CVE identifier in the format CVE-YYYY-NNNN.
@@ -56,12 +63,10 @@ async def lookup_cve(cve_id: str) -> dict[str, Any]:
     validated = _validate_cve_id(cve_id)
     if isinstance(validated, dict):
         return validated
-
     try:
         raw = await fetch_cve(validated)
     except NvdError as e:
         return {"error": str(e), "cve_id": validated}
-
     return format_cve(extract_cve(raw))
 
 
@@ -74,11 +79,8 @@ async def get_epss_score(cve_id: str) -> dict[str, Any]:
     """Get the EPSS (Exploit Prediction Scoring System) score for a CVE.
 
     EPSS estimates the probability that a CVE will be exploited in the wild
-    within the next 30 days, based on observed exploitation activity and
-    vulnerability characteristics. Updated daily by FIRST.org.
-
-    The percentile is usually more useful than the raw probability — a 95th
-    percentile CVE is more likely to be exploited than 95% of all known CVEs.
+    within the next 30 days, based on observed exploitation activity. Updated
+    daily by FIRST.org.
 
     Args:
         cve_id: A CVE identifier in the format CVE-YYYY-NNNN.
@@ -86,12 +88,10 @@ async def get_epss_score(cve_id: str) -> dict[str, Any]:
     validated = _validate_cve_id(cve_id)
     if isinstance(validated, dict):
         return validated
-
     try:
         result = await fetch_epss(validated)
     except EpssError as e:
         return {"error": str(e), "cve_id": validated}
-
     return format_epss(result)
 
 
@@ -101,12 +101,10 @@ async def get_epss_score(cve_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 async def check_kev_status(cve_id: str) -> dict[str, Any]:
-    """Check whether a CVE is on CISA's Known Exploited Vulnerabilities (KEV) catalog.
+    """Check whether a CVE is on CISA's Known Exploited Vulnerabilities catalog.
 
-    KEV listings indicate confirmed active exploitation in the wild — this is
-    the strongest "patch immediately" signal in the industry. CISA maintains
-    this catalog, and US federal agencies are required to remediate listed
-    CVEs by specific due dates.
+    KEV listings indicate confirmed active exploitation. US federal agencies are
+    required to remediate listed CVEs by specific due dates.
 
     Args:
         cve_id: A CVE identifier in the format CVE-YYYY-NNNN.
@@ -114,32 +112,58 @@ async def check_kev_status(cve_id: str) -> dict[str, Any]:
     validated = _validate_cve_id(cve_id)
     if isinstance(validated, dict):
         return validated
-
     try:
         result = await lookup_kev(validated)
     except KevError as e:
         return {"error": str(e), "cve_id": validated}
-
     return format_kev(result)
 
 
 # ============================================================
-# Tool 4: triage_cve (the orchestrator — the actually-useful tool)
+# Tool 4: search_exploit_db (NEW)
+# ============================================================
+
+@mcp.tool()
+async def search_exploit_db(cve_id: str) -> dict[str, Any]:
+    """Search Exploit-DB for public exploit code matching a CVE.
+
+    Use whenever the user asks whether a working exploit exists, or wants to
+    understand how easily a vulnerability could be weaponized. Public exploit
+    code dramatically lowers the skill bar for attackers — its existence is
+    a strong urgency signal independent of CVSS.
+
+    Returns the count of available exploits and details (author, date,
+    platform) of the most recent ones, plus direct links to Exploit-DB.
+
+    Args:
+        cve_id: A CVE identifier in the format CVE-YYYY-NNNN.
+    """
+    validated = _validate_cve_id(cve_id)
+    if isinstance(validated, dict):
+        return validated
+    try:
+        exploits = await lookup_exploits(validated)
+    except ExploitDbError as e:
+        return {"error": str(e), "cve_id": validated}
+    return format_exploits(exploits)
+
+
+# ============================================================
+# Tool 5: triage_cve
 # ============================================================
 
 @mcp.tool()
 async def triage_cve(cve_id: str) -> dict[str, Any]:
     """Run a full triage on a CVE: combines CVSS severity, EPSS exploitation
-    probability, and CISA KEV status into a single verdict with reasoning.
+    probability, CISA KEV status, AND public exploit availability into a single
+    verdict with reasoning.
 
-    Use this whenever the user is trying to decide whether/when to patch a CVE,
-    or asks "is this critical?" / "should I worry about this?" / "what's the
-    risk?" This is the most useful tool in the suite — a single CVE lookup
-    rarely tells you what to actually do; this one does.
+    Use this whenever the user is trying to decide whether or when to patch a
+    CVE, or asks "is this critical?" / "should I worry about this?" / "what's
+    the risk?" This is the most useful tool in the suite.
 
     Returns a decision (PATCH_IMMEDIATELY / PATCH_THIS_WEEK / PATCH_NEXT_CYCLE
-    / MONITOR / UNKNOWN) plus the supporting data and the rules that produced
-    the decision.
+    / MONITOR / UNKNOWN) plus the supporting data and rules that produced it.
 
     Args:
         cve_id: A CVE identifier in the format CVE-YYYY-NNNN.
@@ -147,29 +171,78 @@ async def triage_cve(cve_id: str) -> dict[str, Any]:
     validated = _validate_cve_id(cve_id)
     if isinstance(validated, dict):
         return validated
-
     return await triage(validated)
 
 
 # ============================================================
-# Tool 5: get_mitigation
+# Tool 6: bulk_triage (NEW)
+# ============================================================
+
+@mcp.tool()
+async def bulk_triage(cve_ids: list[str]) -> dict[str, Any]:
+    """Triage multiple CVEs in parallel and return them in patch-priority order.
+
+    Use whenever the user provides a list of CVEs (e.g. scanner output, a patch
+    backlog, a list of CVEs mentioned in an article) and wants to know which to
+    address first. Runs all triages concurrently (asyncio.gather with bounded
+    concurrency) and sorts results by verdict priority then CVSS score.
+
+    Capped at 50 CVEs per call. Split larger batches across multiple calls.
+
+    Args:
+        cve_ids: A list of CVE identifiers, e.g. ["CVE-2021-44228", "CVE-2024-3400"].
+    """
+    return await _bulk_triage(cve_ids)
+
+
+# ============================================================
+# Tool 7: get_mitigation
 # ============================================================
 
 @mcp.tool()
 async def get_mitigation(cve_id: str) -> dict[str, Any]:
     """Get mitigation and remediation guidance for a CVE.
 
-    Pulls patch links, vendor advisories, and CISA-required actions directly
-    from authoritative sources (NVD references and the KEV catalog). For
+    Pulls patch links, vendor advisories, and CISA-required actions from
+    authoritative sources (NVD references and the KEV catalog). For
     vulnerability classes (CWEs) where applicable, also includes generic
     hardening guidance.
 
-    This tool deliberately does NOT generate CVE-specific remediation steps
-    from training data — only sourced, verifiable references and standard
-    CWE-class guidance.
+    Does NOT generate CVE-specific remediation from training data — only
+    sourced, verifiable references plus standard CWE-class guidance.
 
-    Use this when the user asks "how do I fix this?" / "is there a patch?" /
-    "what should I do about this?"
+    Args:
+        cve_id: A CVE identifier in the format CVE-YYYY-NNNN.
+    """
+    validated = _validate_cve_id(cve_id)
+    if isinstance(validated, dict):
+        return validated
+    try:
+        raw = await fetch_cve(validated)
+    except NvdError as e:
+        return {"error": str(e), "cve_id": validated}
+    cve = extract_cve(raw)
+    kev_entry = None
+    try:
+        kev_entry = await lookup_kev(validated)
+    except KevError:
+        pass
+    return extract_mitigation(cve, kev_entry)
+
+
+# ============================================================
+# Tool 8: map_to_attack_techniques (NEW)
+# ============================================================
+
+@mcp.tool()
+async def map_to_attack_techniques(cve_id: str) -> dict[str, Any]:
+    """Map a CVE to MITRE ATT&CK techniques via its CWE classifications.
+
+    Use this when the user is doing threat modeling, building detections, or
+    asking "how would an attacker use this?" Translates the vulnerability
+    classes (CWEs) of a CVE into the MITRE ATT&CK techniques an adversary
+    would employ to exploit them — bridging the gap between a vulnerability
+    record and the attacker behaviors a SOC team monitors for.
 
     Args:
         cve_id: A CVE identifier in the format CVE-YYYY-NNNN.
@@ -178,21 +251,28 @@ async def get_mitigation(cve_id: str) -> dict[str, Any]:
     if isinstance(validated, dict):
         return validated
 
-    # Fetch the CVE record (always required).
     try:
         raw = await fetch_cve(validated)
     except NvdError as e:
         return {"error": str(e), "cve_id": validated}
+
     cve = extract_cve(raw)
+    formatted = format_cve(cve)
+    cwes = formatted.get("weaknesses", [])
 
-    # Try to fetch KEV — but if it fails, mitigation still works without it.
-    kev_entry = None
-    try:
-        kev_entry = await lookup_kev(validated)
-    except KevError:
-        pass  # Non-fatal; mitigation just won't include KEV-required action.
+    if not cwes:
+        return {
+            "cve_id": validated,
+            "error": "No CWE classifications found for this CVE; ATT&CK mapping requires CWEs.",
+            "cwes_found": [],
+        }
 
-    return extract_mitigation(cve, kev_entry)
+    mapping = map_cwes_to_attack(cwes)
+    return {
+        "cve_id": validated,
+        "cwes_used_for_mapping": cwes,
+        **mapping,
+    }
 
 
 def main() -> None:

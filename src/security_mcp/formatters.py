@@ -162,3 +162,34 @@ def format_kev(kev: dict[str, Any] | None) -> dict[str, Any]:
         "notes": kev.get("notes"),
         "source_url": "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
     }
+
+
+# ============================================================
+# Exploit-DB formatting
+# ============================================================
+
+def format_exploits(exploits: list[dict[str, Any]]) -> dict[str, Any]:
+    """Format an Exploit-DB lookup result.
+
+    Public exploit code is a meaningful urgency signal: it lowers the
+    skill barrier and the time-to-exploit dramatically.
+    """
+    if not exploits:
+        return {
+            "public_exploits_available": False,
+            "count": 0,
+            "note": "No public exploits found in Exploit-DB for this CVE.",
+        }
+
+    # Sort by date (newest first) and limit to 5 most recent for the LLM.
+    sorted_exploits = sorted(
+        exploits, key=lambda e: e.get("date_published") or "", reverse=True
+    )
+
+    return {
+        "public_exploits_available": True,
+        "count": len(exploits),
+        "verified_count": sum(1 for e in exploits if e.get("verified")),
+        "most_recent": sorted_exploits[:5],
+        "source_url": "https://www.exploit-db.com/",
+    }
